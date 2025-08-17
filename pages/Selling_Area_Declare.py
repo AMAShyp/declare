@@ -5,7 +5,7 @@ import numpy as np
 import pydeck as pdk
 
 from db_handler import DatabaseManager
-from shelf_map import ShelfMapHandler
+from shelf_map.shelf_map_handler import ShelfMapHandler
 
 
 # Optional: barcode scanning (QR)
