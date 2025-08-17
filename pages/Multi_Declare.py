@@ -1,4 +1,4 @@
-# streamlit_page_multi_declare_by_location.py
+# streamlit_app_location_then_multi_declare.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -14,11 +14,33 @@ try:
 except ImportError:
     QR_AVAILABLE = False
 
-# ------------- PAGE CONFIG -------------
-st.set_page_config(layout="wide")
-st.title("🟢 Multi-Declare: Pick Location → Add Multiple Items")
 
-# ------------- HELPERS (geometry + map) -------------
+# ==================== PAGE CONFIG ====================
+st.set_page_config(layout="centered")
+st.title("📍 Confirm Location → 📦 Declare Multiple Items")
+
+st.markdown("""
+<style>
+.step-title {font-size:1.2rem;margin:0.35rem 0 0.2rem 0;}
+.catline {margin:0.05em 0;font-size:0.98em;}
+.cat-class {color:#C61C1C;font-weight:bold;}
+.cat-dept {color:#004CBB;font-weight:bold;}
+.cat-sect {color:#098A23;font-weight:bold;}
+.cat-family {color:#FF8800;font-weight:bold;}
+.cat-val {color:#111;}
+.okchip{display:inline-block;background:#E6F4EA;color:#0F9D58;border:1px solid #9CD1B5;
+        padding:.15em .55em;border-radius:.6em;font-weight:600;margin-left:.35em;}
+.badchip{display:inline-block;background:#FDEDED;color:#D93025;border:1px solid #F3B1AB;
+        padding:.15em .55em;border-radius:.6em;font-weight:600;margin-left:.35em;}
+.scan-hint {font-size:1.05em;color:#087911;font-weight:600;background:#eafdff;padding:.2em .7em;border-radius:.45em;margin:.4em 0 .8em 0;text-align:center;}
+.small-dim {color:#666;font-size:.9em;margin-top:.25rem;}
+.tbl-note {color:#444;margin:0.35rem 0 0.3rem 0;}
+.locked-loc {background:#f4f9ff;border:1.5px solid #9dc3f5;border-radius:.6em;padding:.55em .8em;margin:.45em 0;}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ==================== HELPERS ====================
 def to_float(x):
     try:
         return float(x)
@@ -35,12 +57,12 @@ def make_rectangle(x, y, w, h, deg):
     rot = corners @ np.array([[c, -s], [s, c]])
     abs_pts = rot + [cx, cy]
     pts = abs_pts.tolist()
-    pts.append(pts[0])  # close
+    pts.append(pts[0])  # close polygon
     return pts
 
 def build_deck(shelf_locs, highlight_locs, selected_locid=""):
     """
-    - Base PolygonLayer 'shelves'
+    - Base PolygonLayer 'shelves' (grey or red for highlight)
     - Optional selected overlay (blue outline) for the clicked shelf
     - Tooltip shows a single-line label
     """
@@ -77,7 +99,7 @@ def build_deck(shelf_locs, highlight_locs, selected_locid=""):
 
     layers = [base_layer]
 
-    # Optional selected overlay (blue outline + semi-transparent fill)
+    # Selected overlay
     if selected_locid:
         sel_df = df[df["locid"] == str(selected_locid)]
         if not sel_df.empty:
@@ -96,7 +118,8 @@ def build_deck(shelf_locs, highlight_locs, selected_locid=""):
             layers.append(sel_layer)
 
     view_state = pdk.ViewState(
-        longitude=0.5, latitude=0.5, zoom=6, min_zoom=4, max_zoom=20, pitch=0, bearing=0
+        longitude=0.5, latitude=0.5,
+        zoom=6, min_zoom=4, max_zoom=20, pitch=0, bearing=0
     )
 
     deck = pdk.Deck(
@@ -104,40 +127,65 @@ def build_deck(shelf_locs, highlight_locs, selected_locid=""):
         initial_view_state=view_state,
         map_provider=None,  # normalized canvas 0..1
         tooltip={"html": "<b>{label_text}</b>", "style": {"fontSize": "14px", "font-family": "monospace"}},
-        height=520,
+        height=550,
     )
     return deck
 
-# ------------- DATA ACCESS -------------
+
+# ==================== DATA ACCESS ====================
 class DeclareHandler(DatabaseManager):
     def get_item_by_barcode(self, barcode):
-        df = self.fetch_data(
-            """
+        df = self.fetch_data("""
             SELECT itemid, itemnameenglish AS name, barcode,
                    familycat, sectioncat, departmentcat, classcat
             FROM item
             WHERE barcode = %s
             LIMIT 1
-            """,
-            (barcode,),
-        )
+        """, (barcode,))
         return df.iloc[0] if not df.empty else None
 
-    def insert_declaration(self, itemid, locid, qty):
-        # Append-only: insert a new row into shelfentries (NO expirationdate)
-        self.execute_command(
-            """
+    def get_inventory_total(self, itemid):
+        df = self.fetch_data("""
+            SELECT SUM(quantity) as total
+            FROM inventory
+            WHERE itemid=%s AND quantity > 0
+        """, (int(itemid),))
+        return int(df.iloc[0]['total']) if not df.empty and df.iloc[0]['total'] is not None else 0
+
+    def get_item_locations(self, itemid):
+        df = self.fetch_data("""
+            SELECT DISTINCT locid
+            FROM shelfentries
+            WHERE itemid=%s AND locid IS NOT NULL AND locid <> ''
+            ORDER BY locid
+        """, (int(itemid),))
+        return df["locid"].tolist() if not df.empty else []
+
+    def insert_declaration(self, itemid, locid, qty, who="Unknown"):
+        self.execute_command("""
             INSERT INTO shelfentries
                 (itemid, quantity, locid, trx_type, note, reference_id, reference_type)
             VALUES
                 (%s, %s, %s, 'STOCKTAKE', 'declare', NULL, NULL)
-            """,
-            (int(itemid), int(qty), str(locid)),
-        )
+        """, (int(itemid), int(qty), str(locid)))
+
+    def bulk_insert_declarations(self, rows):
+        """
+        rows: list of dicts with keys: itemid, locid, qty
+        """
+        if not rows:
+            return
+        # Use executemany-friendly INSERT
+        values = [(int(r["itemid"]), int(r["qty"]), str(r["locid"])) for r in rows]
+        self.execute_many("""
+            INSERT INTO shelfentries
+                (itemid, quantity, locid, trx_type, note, reference_id, reference_type)
+            VALUES
+                (%s, %s, %s, 'STOCKTAKE', 'declare', NULL, NULL)
+        """, values)
 
     def get_recent_declarations_at_location(self, locid, limit=200):
-        df = self.fetch_data(
-            """
+        df = self.fetch_data("""
             SELECT
                 se.entryid,
                 se.itemid,
@@ -150,211 +198,212 @@ class DeclareHandler(DatabaseManager):
             WHERE se.locid = %s AND se.note = 'declare'
             ORDER BY se.entrydate DESC, se.entryid DESC
             LIMIT %s
-            """,
-            (str(locid), int(limit)),
-        )
+        """, (str(locid), int(limit)))
         return df if not df.empty else pd.DataFrame(columns=["entryid", "itemid", "name", "barcode", "quantity", "entrydate"])
 
-# ------------- STATE -------------
-st.session_state.setdefault("picked_locid", "")            # from map click (pre-confirm)
-st.session_state.setdefault("confirmed_locid", "")         # fixed after confirm
-st.session_state.setdefault("items_cart", [])              # [{'itemid','name','barcode','qty'}]
-st.session_state.setdefault("last_scanned_barcode", "")
+
+# ==================== STATE ====================
+st.session_state.setdefault("picked_locid", "")
+st.session_state.setdefault("loc_confirmed", False)
+st.session_state.setdefault("staged_items", [])  # list of dicts: {itemid, name, barcode, qty}
+st.session_state.setdefault("last_added_barcode", "")
 
 handler = DeclareHandler()
 map_handler = ShelfMapHandler()
 
-# ------------- STEP 1: PICK + CONFIRM LOCATION -------------
-st.subheader("1) Choose a Shelf Location")
 
-# If not yet confirmed, allow picking from map + manual override
-if not st.session_state["confirmed_locid"]:
-    shelf_locs = map_handler.get_locations()
-    deck = build_deck(shelf_locs, highlight_locs=[], selected_locid=st.session_state["picked_locid"])
-    event = st.pydeck_chart(
-        deck,
-        use_container_width=True,
-        on_select="rerun",
-        selection_mode="single-object",
-        key="pick_loc_map",
+# ==================== STEP 1: SELECT & CONFIRM LOCATION ====================
+st.markdown("<div class='step-title'>STEP 1 — Choose a shelf location and confirm</div>", unsafe_allow_html=True)
+
+# Full map (no highlights initially; could highlight last used locs if you want)
+shelf_locs = map_handler.get_locations()
+deck = build_deck(shelf_locs, highlight_locs=None, selected_locid=st.session_state["picked_locid"])
+
+event = st.pydeck_chart(
+    deck,
+    use_container_width=True,
+    on_select="rerun",
+    selection_mode="single-object",
+    key="loc_select_map",
+)
+
+# Extract clicked object → update picked_locid
+try:
+    sel = getattr(event, "selection", None) or event.get("selection") if isinstance(event, dict) else None
+    if sel:
+        objs = sel.get("objects", {}) if isinstance(sel, dict) else {}
+        picked_list = objs.get("shelves") or []
+        if picked_list:
+            first = picked_list[0]
+            data = first.get("object") if isinstance(first, dict) and "object" in first else first
+            locid_clicked = str(data.get("locid") or "")
+            if locid_clicked:
+                st.session_state["picked_locid"] = locid_clicked
+except Exception:
+    pass  # fail gracefully
+
+c1, c2 = st.columns([2, 1])
+typed_locid = c1.text_input(
+    "Or type a locid manually (optional):",
+    value=st.session_state["picked_locid"],
+    key="manual_locid_entry"
+).strip()
+
+confirm_loc = c2.button("✅ Confirm Location", type="primary", use_container_width=True)
+
+if confirm_loc:
+    final_locid = typed_locid or st.session_state["picked_locid"]
+    if not final_locid:
+        st.error("Please click a shelf on the map or type a locid before confirming.")
+    else:
+        st.session_state["picked_locid"] = final_locid
+        st.session_state["loc_confirmed"] = True
+        st.success(f"Location confirmed: **{final_locid}**")
+
+if st.session_state["loc_confirmed"]:
+    st.markdown(
+        f"<div class='locked-loc'>Confirmed location: <b>{st.session_state['picked_locid']}</b>"
+        f" <span class='okchip'>Locked</span></div>", unsafe_allow_html=True
+    )
+    if st.button("🔓 Change location"):
+        st.session_state["loc_confirmed"] = False
+        st.session_state["staged_items"] = []  # clear staged when changing location
+        st.info("Location unlocked. Pick or type a new location, then confirm.")
+else:
+    st.info("Choose a location on the map or type one, then press **Confirm Location**.")
+    st.stop()  # halt until location is confirmed
+
+
+# ==================== STEP 2: STAGE MULTIPLE ITEMS FOR THIS LOCATION ====================
+st.markdown("<div class='step-title'>STEP 2 — Add items (you can add many) for the confirmed location</div>", unsafe_allow_html=True)
+locid = st.session_state["picked_locid"]
+
+# Input row: barcode + quantity, add button
+with st.expander("➕ Add item by barcode", expanded=True):
+    left, mid, right = st.columns([2.2, 1, 1])
+    if QR_AVAILABLE:
+        st.markdown("<div class='scan-hint'>Scan with webcam/phone for instant barcode input.</div>", unsafe_allow_html=True)
+        scanned = qrcode_scanner(key="barcode_cam_multi") or ""
+        if scanned:
+            st.session_state["last_added_barcode"] = scanned
+
+    barcode_input = left.text_input(
+        "Barcode",
+        key="barcode_input_multi",
+        value=st.session_state.get("last_added_barcode", ""),
+        max_chars=32
+    ).strip()
+
+    qty_input = mid.number_input(
+        "Quantity",
+        min_value=1, value=1, step=1, key="qty_input_multi"
     )
 
-    # Extract clicked object → update picked_locid
-    try:
-        sel = getattr(event, "selection", None) or (event.get("selection") if isinstance(event, dict) else None)
-        if sel:
-            objs = sel.get("objects", {}) if isinstance(sel, dict) else {}
-            picked_list = objs.get("shelves") or []
-            if picked_list:
-                first = picked_list[0]
-                data = first.get("object") if isinstance(first, dict) and "object" in first else first
-                locid_clicked = str(data.get("locid") or "")
-                if locid_clicked:
-                    st.session_state["picked_locid"] = locid_clicked
-    except Exception:
-        pass  # fail gracefully
+    add_clicked = right.button("Add to list", key="btn_add_item", use_container_width=True)
 
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        st.text_input(
-            "Or type a locid (optional)",
-            value=st.session_state["picked_locid"],
-            key="typed_locid",
-            help="If filled, this overrides the picked shelf.",
-        )
-    with c2:
-        confirm = st.button("✅ Confirm Location", use_container_width=True)
-        if confirm:
-            final_loc = (st.session_state.get("typed_locid") or st.session_state["picked_locid"]).strip()
-            if not final_loc:
-                st.error("Please select a shelf on the map or type a locid before confirming.")
-            else:
-                st.session_state["confirmed_locid"] = final_loc
-                st.success(f"Location confirmed: **{final_loc}**")
-                st.rerun()
-else:
-    # Location already confirmed — show banner + controls
-    with st.container():
-        st.markdown(
-            f"""<div style='background:#e7f8ff;border:1.5px solid #66b1ff;
-                   border-radius:0.5em;padding:.7em 1em;margin:.4em 0 1em 0;'>
-                   <b>Confirmed Location:</b> <span style='color:#0b63d1;'>{st.session_state["confirmed_locid"]}</span>
-                 </div>""",
-            unsafe_allow_html=True
-        )
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("🧹 New Declare (pick a new location)", use_container_width=True):
-            # Reset everything to start over
-            for k in ["picked_locid", "confirmed_locid", "items_cart", "last_scanned_barcode"]:
-                st.session_state[k] = "" if isinstance(st.session_state[k], str) else []
-            st.rerun()
-    with c2:
-        st.write("")  # spacer
-
-# ------------- STEP 2: DECLARE MULTIPLE ITEMS -------------
-st.subheader("2) Add Items for This Location")
-
-if not st.session_state["confirmed_locid"]:
-    st.info("Confirm a location above to start adding items.")
-else:
-    # Input: scan/type barcodes, set qty, add to cart
-    tabs = st.tabs(["📷 Scan via camera", "⌨️ Type/paste barcode"])
-
-    def add_item_to_cart(scanned_barcode: str, qty: int):
-        if not scanned_barcode:
-            st.warning("Please scan or enter a barcode.")
-            return
-        item = handler.get_item_by_barcode(scanned_barcode)
-        if item is None:
-            st.error("❌ Barcode not found in the item table.")
-            return
-        # If item already in cart, just bump its qty
-        cart = st.session_state["items_cart"]
-        for row in cart:
-            if int(row["itemid"]) == int(item["itemid"]):
-                row["qty"] = max(0, int(row["qty"])) + int(qty)
-                st.success(f"Updated '{item['name']}' quantity to {row['qty']}.")
-                return
-        cart.append({
-            "itemid": int(item["itemid"]),
-            "name": str(item["name"]),
-            "barcode": str(item["barcode"]),
-            "qty": int(qty)
-        })
-        st.success(f"Added '{item['name']}' ({item['barcode']}) with qty {qty}.")
-
-    with tabs[0]:
-        if QR_AVAILABLE:
-            st.caption("Aim the barcode at your phone or webcam for instant detection.")
-            scanned = qrcode_scanner(key="barcode_multi_cam") or ""
-            qty_cam = st.number_input("Qty", min_value=1, value=1, step=1, key="qty_cam")
-            c1, c2 = st.columns([3, 1])
-            with c1:
-                st.text_input("Last scanned", value=scanned, key="last_scanned_barcode", disabled=True)
-            with c2:
-                if st.button("➕ Add", key="add_cam"):
-                    add_item_to_cart(scanned, qty_cam)
+    if add_clicked:
+        if not barcode_input:
+            st.warning("Please provide a barcode.")
         else:
-            st.warning("Camera scanning not available. Install: pip install streamlit-qrcode-scanner")
+            item = handler.get_item_by_barcode(barcode_input)
+            if item is None:
+                st.error("Barcode not found in the item table.")
+            else:
+                itemid = int(item["itemid"])
+                # If item already staged, sum quantities instead of duplicate line
+                merged = False
+                for row in st.session_state["staged_items"]:
+                    if row["itemid"] == itemid:
+                        row["qty"] += int(qty_input)
+                        merged = True
+                        break
+                if not merged:
+                    st.session_state["staged_items"].append({
+                        "itemid": itemid,
+                        "name": item["name"],
+                        "barcode": item["barcode"],
+                        "qty": int(qty_input),
+                    })
+                st.session_state["last_added_barcode"] = barcode_input
+                st.success(f"Added: {item['name']} x {int(qty_input)}")
 
-    with tabs[1]:
-        typed_bc = st.text_input("Enter barcode", key="typed_barcode")
-        qty_typed = st.number_input("Qty", min_value=1, value=1, step=1, key="qty_typed")
-        c1, c2 = st.columns([3, 1])
+
+# Staged items table with inline quantity editing & remove
+if st.session_state["staged_items"]:
+    st.markdown("<div class='tbl-note'>Review your staged items. You can adjust quantities or remove rows.</div>", unsafe_allow_html=True)
+    # Build editing UI
+    new_rows = []
+    for idx, row in enumerate(st.session_state["staged_items"]):
+        c1, c2, c3, c4, c5 = st.columns([3, 2, 1.2, 1.2, 1])
+        with c1:
+            st.markdown(f"**{row['name']}**  \n`{row['barcode']}`")
         with c2:
-            if st.button("➕ Add", key="add_typed"):
-                add_item_to_cart(typed_bc, qty_typed)
+            inv = handler.get_inventory_total(row["itemid"])
+            st.caption(f"Inventory (read-only): **{inv}**")
+        with c3:
+            new_qty = st.number_input(
+                f"Qty #{idx+1}",
+                min_value=1, value=int(row["qty"]), step=1, key=f"qty_edit_{idx}"
+            )
+        with c4:
+            # show item historical locs (tiny info)
+            locs = handler.get_item_locations(row["itemid"])
+            st.caption(f"Seen at: {', '.join(map(str, locs[:3]))}{'…' if len(locs)>3 else ''}" if locs else "Seen at: —")
+        with c5:
+            remove = st.button("🗑️", key=f"rm_{idx}")
+            if remove:
+                continue  # skip adding this row (removed)
+        # keep (with edited qty)
+        new_rows.append({**row, "qty": int(new_qty)})
 
-    # Cart table with per-row quantity edits + remove
-    cart = st.session_state["items_cart"]
-    if cart:
-        st.markdown("#### Pending Declarations")
-        # Render each row with editable qty & remove button
-        to_remove = []
-        for i, row in enumerate(cart):
-            col1, col2, col3, col4, col5 = st.columns([3, 3, 2, 2, 2])
-            with col1:
-                st.write(f"**{row['name']}**")
-            with col2:
-                st.code(row["barcode"])
-            with col3:
-                new_qty = st.number_input(
-                    "Qty",
-                    min_value=0, value=int(row["qty"]), step=1,
-                    key=f"qty_row_{i}", label_visibility="collapsed"
-                )
-                row["qty"] = int(new_qty)
-            with col4:
-                if st.button("🗑️ Remove", key=f"rem_{i}"):
-                    to_remove.append(i)
-            with col5:
-                st.write(f"Item ID: {row['itemid']}")
-            st.markdown("<hr style='margin:0.2rem 0 0.6rem 0;'>", unsafe_allow_html=True)
+    st.session_state["staged_items"] = new_rows
 
-        # Apply removals (from end to start)
-        for idx in sorted(to_remove, reverse=True):
-            cart.pop(idx)
+    # Final actions row
+    cL, cR = st.columns([1, 2])
+    clear_all = cL.button("Clear list")
+    commit = cR.button("✅ Confirm ALL declarations to this location", type="primary")
 
-        # Save all rows
-        save_col1, save_col2 = st.columns([2, 1])
-        with save_col1:
-            st.write(f"**Location:** {st.session_state['confirmed_locid']}")
-        with save_col2:
-            if st.button("✅ Save All Declarations", use_container_width=True):
-                # Filter out zero-qty lines
-                valid_rows = [r for r in cart if int(r["qty"]) > 0]
-                if not valid_rows:
-                    st.error("No positive quantities to save.")
-                else:
-                    for r in valid_rows:
-                        handler.insert_declaration(
-                            itemid=r["itemid"],
-                            locid=st.session_state["confirmed_locid"],
-                            qty=int(r["qty"]),
-                        )
-                    st.success(f"Saved {len(valid_rows)} declaration(s) to {st.session_state['confirmed_locid']}.")
-                    # keep location so user can continue adding; clear cart
-                    st.session_state["items_cart"] = []
-                    st.rerun()
-    else:
-        st.info("No items added yet. Scan or enter a barcode above, set quantity, then click ➕ Add.")
+    if clear_all:
+        st.session_state["staged_items"] = []
+        st.info("Staged list cleared.")
 
-    # Recent declarations for the confirmed location
-    st.markdown("#### Recent Declarations at This Location")
-    recents = handler.get_recent_declarations_at_location(st.session_state["confirmed_locid"])
-    if not recents.empty:
-        st.dataframe(
-            recents.rename(columns={
-                "entryid": "Entry ID",
-                "itemid": "Item ID",
-                "name": "Item Name",
-                "barcode": "Barcode",
-                "quantity": "Declared Qty",
-                "entrydate": "Entry Date"
-            }),
-            hide_index=True,
-            use_container_width=True
-        )
-    else:
-        st.caption("No declarations recorded yet for this shelf location.")
+    if commit:
+        rows = [
+            {"itemid": r["itemid"], "locid": locid, "qty": int(r["qty"])}
+            for r in st.session_state["staged_items"]
+            if int(r["qty"]) > 0
+        ]
+        if not rows:
+            st.error("Nothing to commit. Please add items with positive quantities.")
+        else:
+            # Bulk insert
+            try:
+                handler.bulk_insert_declarations(rows)
+                st.success(f"Recorded {len(rows)} declarations to location **{locid}**.")
+                st.session_state["staged_items"] = []
+            except Exception as e:
+                st.error("Could not save declarations.")
+
+else:
+    st.info("No items staged yet. Add items above by scanning or typing a barcode.")
+
+
+# ==================== RECENT DECLARATIONS AT LOCATION ====================
+st.markdown("<hr/>", unsafe_allow_html=True)
+st.markdown("#### 🕒 Recent declarations at this location")
+recents = handler.get_recent_declarations_at_location(locid, limit=200)
+if recents.empty:
+    st.caption("No declarations recorded yet for this shelf location.")
+else:
+    st.dataframe(
+        recents.rename(columns={
+            "entryid": "Entry ID",
+            "itemid": "Item ID",
+            "name": "Item Name",
+            "barcode": "Barcode",
+            "quantity": "Declared Qty",
+            "entrydate": "Entry Date"
+        }),
+        hide_index=True,
+        use_container_width=True
+    )
