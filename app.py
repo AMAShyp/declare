@@ -3,6 +3,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import pydeck as pdk
+import psycopg2
+import psycopg2.extras
 
 from db_handler import DatabaseManager
 from shelf_map.shelf_map_handler import ShelfMapHandler
@@ -40,7 +42,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ==================== HELPERS ====================
+# ==================== GEOMETRY HELPERS ====================
 def to_float(x):
     try:
         return float(x)
@@ -60,7 +62,7 @@ def make_rectangle(x, y, w, h, deg):
     pts.append(pts[0])  # close polygon
     return pts
 
-def build_deck(shelf_locs, highlight_locs, selected_locid=""):
+def build_deck(shelf_locs, highlight_locs=None, selected_locid=""):
     """
     - Base PolygonLayer 'shelves' (grey or red for highlight)
     - Optional selected overlay (blue outline) for the clicked shelf
@@ -99,7 +101,6 @@ def build_deck(shelf_locs, highlight_locs, selected_locid=""):
 
     layers = [base_layer]
 
-    # Selected overlay
     if selected_locid:
         sel_df = df[df["locid"] == str(selected_locid)]
         if not sel_df.empty:
@@ -122,18 +123,18 @@ def build_deck(shelf_locs, highlight_locs, selected_locid=""):
         zoom=6, min_zoom=4, max_zoom=20, pitch=0, bearing=0
     )
 
-    deck = pdk.Deck(
+    return pdk.Deck(
         layers=layers,
         initial_view_state=view_state,
         map_provider=None,  # normalized canvas 0..1
         tooltip={"html": "<b>{label_text}</b>", "style": {"fontSize": "14px", "font-family": "monospace"}},
         height=550,
     )
-    return deck
 
 
 # ==================== DATA ACCESS ====================
 class DeclareHandler(DatabaseManager):
+    # --- read helpers ---
     def get_item_by_barcode(self, barcode):
         df = self.fetch_data("""
             SELECT itemid, itemnameenglish AS name, barcode,
@@ -161,29 +162,6 @@ class DeclareHandler(DatabaseManager):
         """, (int(itemid),))
         return df["locid"].tolist() if not df.empty else []
 
-    def insert_declaration(self, itemid, locid, qty, who="Unknown"):
-        self.execute_command("""
-            INSERT INTO shelfentries
-                (itemid, quantity, locid, trx_type, note, reference_id, reference_type)
-            VALUES
-                (%s, %s, %s, 'STOCKTAKE', 'declare', NULL, NULL)
-        """, (int(itemid), int(qty), str(locid)))
-
-    def bulk_insert_declarations(self, rows):
-        """
-        rows: list of dicts with keys: itemid, locid, qty
-        """
-        if not rows:
-            return
-        # Use executemany-friendly INSERT
-        values = [(int(r["itemid"]), int(r["qty"]), str(r["locid"])) for r in rows]
-        self.execute_many("""
-            INSERT INTO shelfentries
-                (itemid, quantity, locid, trx_type, note, reference_id, reference_type)
-            VALUES
-                (%s, %s, %s, 'STOCKTAKE', 'declare', NULL, NULL)
-        """, values)
-
     def get_recent_declarations_at_location(self, locid, limit=200):
         df = self.fetch_data("""
             SELECT
@@ -201,6 +179,56 @@ class DeclareHandler(DatabaseManager):
         """, (str(locid), int(limit)))
         return df if not df.empty else pd.DataFrame(columns=["entryid", "itemid", "name", "barcode", "quantity", "entrydate"])
 
+    # --- write helpers ---
+    def insert_declaration(self, itemid, locid, qty):
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO shelfentries
+                    (itemid, quantity, locid, trx_type, note, reference_id, reference_type)
+                VALUES
+                    (%s, %s, %s, 'STOCKTAKE', 'declare', NULL, NULL)
+            """, (int(itemid), int(qty), str(locid)))
+
+    def bulk_insert_declarations(self, rows):
+        """
+        rows: list of dicts with keys: itemid, locid, qty
+        Uses execute_values for true bulk insert. Falls back to per-row on error.
+        """
+        if not rows:
+            return 0
+
+        values = [(int(r["itemid"]), int(r["qty"]), str(r["locid"])) for r in rows if int(r["qty"]) > 0]
+        if not values:
+            return 0
+
+        sql = """
+            INSERT INTO shelfentries
+                (itemid, quantity, locid, trx_type, note, reference_id, reference_type)
+            VALUES %s
+        """
+        template = "(%s, %s, %s, 'STOCKTAKE', 'declare', NULL, NULL)"
+
+        try:
+            with self.conn.cursor() as cur:
+                psycopg2.extras.execute_values(cur, sql, values, template=template)
+            return len(values)
+        except Exception:
+            # Fallback: best-effort per-row insert (avoid partial failure)
+            inserted = 0
+            with self.conn.cursor() as cur:
+                for v in values:
+                    try:
+                        cur.execute("""
+                            INSERT INTO shelfentries
+                                (itemid, quantity, locid, trx_type, note, reference_id, reference_type)
+                            VALUES
+                                (%s, %s, %s, 'STOCKTAKE', 'declare', NULL, NULL)
+                        """, v)
+                        inserted += 1
+                    except Exception:
+                        pass
+            return inserted
+
 
 # ==================== STATE ====================
 st.session_state.setdefault("picked_locid", "")
@@ -211,14 +239,21 @@ st.session_state.setdefault("last_added_barcode", "")
 handler = DeclareHandler()
 map_handler = ShelfMapHandler()
 
+# Optional quick ping without printing DeltaGenerator objects
+try:
+    # Keep ping lightweight: select 1
+    with handler.conn.cursor() as _c:
+        _c.execute("SELECT 1;")
+    st.success("DB connection OK ✅")
+except Exception:
+    st.error("DB connection failed ❌")
+
 
 # ==================== STEP 1: SELECT & CONFIRM LOCATION ====================
 st.markdown("<div class='step-title'>STEP 1 — Choose a shelf location and confirm</div>", unsafe_allow_html=True)
 
-# Full map (no highlights initially; could highlight last used locs if you want)
 shelf_locs = map_handler.get_locations()
-deck = build_deck(shelf_locs, highlight_locs=None, selected_locid=st.session_state["picked_locid"])
-
+deck = build_deck(shelf_locs, selected_locid=st.session_state["picked_locid"])
 event = st.pydeck_chart(
     deck,
     use_container_width=True,
@@ -229,7 +264,7 @@ event = st.pydeck_chart(
 
 # Extract clicked object → update picked_locid
 try:
-    sel = getattr(event, "selection", None) or event.get("selection") if isinstance(event, dict) else None
+    sel = getattr(event, "selection", None) or (event.get("selection") if isinstance(event, dict) else None)
     if sel:
         objs = sel.get("objects", {}) if isinstance(sel, dict) else {}
         picked_list = objs.get("shelves") or []
@@ -376,14 +411,18 @@ if st.session_state["staged_items"]:
         if not rows:
             st.error("Nothing to commit. Please add items with positive quantities.")
         else:
-            # Bulk insert
             try:
-                handler.bulk_insert_declarations(rows)
-                st.success(f"Recorded {len(rows)} declarations to location **{locid}**.")
-                st.session_state["staged_items"] = []
-            except Exception as e:
+                inserted = handler.bulk_insert_declarations(rows)
+                if inserted == len(rows):
+                    st.success(f"Recorded {inserted} declarations to location **{locid}**.")
+                    st.session_state["staged_items"] = []
+                elif inserted > 0:
+                    st.warning(f"Partially saved: {inserted}/{len(rows)} rows inserted. Please review.")
+                    st.session_state["staged_items"] = []
+                else:
+                    st.error("Could not save declarations.")
+            except Exception:
                 st.error("Could not save declarations.")
-
 else:
     st.info("No items staged yet. Add items above by scanning or typing a barcode.")
 
