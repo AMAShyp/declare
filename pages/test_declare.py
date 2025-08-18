@@ -1,4 +1,4 @@
-# streamlit_app_location_then_multi_declare.py (fixed: no post-instantiation state mutation)
+# streamlit_app_location_then_multi_declare.py (robust save + clean form)
 import time
 import streamlit as st
 import pandas as pd
@@ -27,6 +27,8 @@ st.markdown("""
 .tbl-note {color:#444;margin:0.35rem 0 0.3rem 0;}
 .locked-loc {background:#f4f9ff;border:1.5px solid #9dc3f5;border-radius:.6em;padding:.55em .8em;margin:.45em 0;}
 .scan-hint {font-size:1.05em;color:#087911;font-weight:600;background:#eafdff;padding:.2em .7em;border-radius:.45em;margin:.4em 0 .8em 0;text-align:center;}
+.errbox{background:#fdecec;border:1px solid #f2b8b5;color:#b3261e;border-radius:.6em;padding:.6em .8em;margin:.6em 0;}
+.okbox{background:#e9f6ef;border:1px solid #b8e0c8;color:#0f5132;border-radius:.6em;padding:.6em .8em;margin:.6em 0;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -140,16 +142,73 @@ class DeclareHandler(DatabaseManager):
         """, (int(itemid),))
         return df["locid"].tolist() if not df.empty else []
 
+    def _validate_rows(self, rows):
+        """Return (valid_rows, errors:list[str])."""
+        valid = []
+        errs = []
+        for i, r in enumerate(rows, start=1):
+            try:
+                itemid = int(r["itemid"])
+            except Exception:
+                errs.append(f"Row {i}: invalid itemid `{r.get('itemid')}`.")
+                continue
+            qty = int(r.get("qty", 0) or 0)
+            locid = str(r.get("locid") or "").strip()
+            if qty <= 0:
+                errs.append(f"Row {i}: quantity must be > 0 (got {qty}).")
+                continue
+            if not locid:
+                errs.append(f"Row {i}: locid is empty.")
+                continue
+            valid.append({"itemid": itemid, "qty": qty, "locid": locid})
+        return valid, errs
+
     def bulk_insert_declarations(self, rows):
+        """
+        Attempts bulk insert; on failure, falls back to per-row to isolate errors.
+        Returns dict: {ok:int, failed:int, errors:list[str]}
+        """
+        result = {"ok": 0, "failed": 0, "errors": []}
         if not rows:
-            return
+            return result
+
+        rows, val_errs = self._validate_rows(rows)
+        if val_errs:
+            result["errors"].extend(val_errs)
+        if not rows:
+            result["failed"] = len(val_errs)
+            return result
+
+        # Preferred: use the DatabaseManager's execute_many
         values = [(int(r["itemid"]), int(r["qty"]), str(r["locid"])) for r in rows]
-        self.execute_many("""
+        sql = """
             INSERT INTO shelfentries
                 (itemid, quantity, locid, trx_type, note, reference_id, reference_type)
             VALUES
                 (%s, %s, %s, 'STOCKTAKE', 'declare', NULL, NULL)
-        """, values)
+        """
+        try:
+            # Fast path
+            self.execute_many(sql, values)
+            result["ok"] = len(values)
+            return result
+        except Exception as e:
+            result["errors"].append(f"Bulk insert failed: {e}")
+
+        # Fallback: per-row to find which ones fail
+        ok = 0
+        bad = 0
+        for idx, tup in enumerate(values, start=1):
+            try:
+                self.execute_command(sql, tup)
+                ok += 1
+            except Exception as e:
+                bad += 1
+                itemid, qty, locid = tup
+                result["errors"].append(f"Row {idx} failed (itemid={itemid}, qty={qty}, locid='{locid}'): {e}")
+        result["ok"] += ok
+        result["failed"] += bad
+        return result
 
     def get_recent_declarations_at_location(self, locid, limit=200):
         df = self.fetch_data("""
@@ -173,7 +232,7 @@ st.session_state.setdefault("picked_locid", "")
 st.session_state.setdefault("loc_confirmed", False)
 st.session_state.setdefault("staged_items", [])   # [{itemid, name, barcode, qty}]
 st.session_state.setdefault("last_add_signature", ("", 0.0))  # (signature, ts)
-st.session_state.setdefault("clear_add_form", False)          # ← clearing flag
+st.session_state.setdefault("clear_add_form", False)          # input clear flag
 
 handler = DeclareHandler()
 map_handler = ShelfMapHandler()
@@ -245,7 +304,6 @@ locid = st.session_state["picked_locid"]
 
 # -------- Pre-widget clearing (runs BEFORE we create the inputs) --------
 if st.session_state["clear_add_form"]:
-    # Clear the input defaults BEFORE rendering widgets
     st.session_state["barcode_input_multi"] = ""
     st.session_state["qty_input_field"] = 1
     st.session_state["clear_add_form"] = False
@@ -254,7 +312,6 @@ with st.expander("➕ Add item by barcode", expanded=True):
     with st.form(key="add_item_form", clear_on_submit=False):
         left, mid, right = st.columns([2.2, 1, 1])
 
-        # Optional QR prefill (set only if we have a value and field is empty)
         if QR_AVAILABLE:
             st.markdown("<div class='scan-hint'>Scan with webcam/phone, then press <b>Add to list</b>.</div>", unsafe_allow_html=True)
             scanned = qrcode_scanner(key="barcode_cam_multi") or ""
@@ -267,13 +324,10 @@ with st.expander("➕ Add item by barcode", expanded=True):
             max_chars=32,
             placeholder="Scan or type barcode"
         )
-        # We'll strip later without mutating session_state
-
         qty_val = mid.number_input(
             "Quantity",
             min_value=1, value=st.session_state.get("qty_input_field", 1), step=1, key="qty_input_field"
         )
-
         submitted = right.form_submit_button("Add to list", use_container_width=True)
 
     if submitted:
@@ -287,7 +341,6 @@ with st.expander("➕ Add item by barcode", expanded=True):
             if item is None:
                 st.error("Barcode not found in the item table.")
             else:
-                # De-dupe very recent identical add (handles fast reruns/double clicks)
                 signature = f"{locid}|{barcode_input}|{qty_input}"
                 last_sig, last_ts = st.session_state["last_add_signature"]
                 now = time.time()
@@ -311,7 +364,6 @@ with st.expander("➕ Add item by barcode", expanded=True):
                     st.success(f"Added: {item['name']} × {qty_input}")
                     st.session_state["last_add_signature"] = (signature, now)
 
-                # Instead of mutating widget state now, flag & rerun
                 st.session_state["clear_add_form"] = True
                 st.rerun()
 
@@ -358,12 +410,25 @@ if st.session_state["staged_items"]:
         if not rows:
             st.error("Nothing to commit. Please add items with positive quantities.")
         else:
-            try:
-                handler.bulk_insert_declarations(rows)
-                st.success(f"Recorded {len(rows)} declarations to location **{locid}**.")
+            with st.spinner("Saving declarations…"):
+                outcome = handler.bulk_insert_declarations(rows)
+
+            ok, failed, errors = outcome["ok"], outcome["failed"], outcome["errors"]
+
+            if ok and not failed:
+                st.success(f"Saved {ok} declaration(s) to **{locid}**.")
                 st.session_state["staged_items"] = []
-            except Exception:
-                st.error("Could not save declarations.")
+            elif ok and failed:
+                st.markdown(f"<div class='okbox'>Partially saved: {ok} succeeded, {failed} failed.</div>", unsafe_allow_html=True)
+                if errors:
+                    st.markdown("<div class='errbox'><b>Details</b><ul>" + "".join([f"<li>{e}</li>" for e in errors]) + "</ul></div>", unsafe_allow_html=True)
+                # Keep items; you can remove the successfully saved ones if you want,
+                # but we keep all so the user can decide.
+            else:
+                st.markdown("<div class='errbox'><b>Could not save any declarations.</b></div>", unsafe_allow_html=True)
+                if errors:
+                    st.markdown("<div class='errbox'><b>Details</b><ul>" + "".join([f"<li>{e}</li>" for e in errors]) + "</ul></div>", unsafe_allow_html=True)
+
 else:
     st.info("No items staged yet. Add items above by scanning or typing a barcode.")
 
