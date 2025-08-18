@@ -1,4 +1,4 @@
-# streamlit_app_location_then_multi_declare.py (clean version)
+# streamlit_app_location_then_multi_declare.py (fixed: no post-instantiation state mutation)
 import time
 import streamlit as st
 import pandas as pd
@@ -22,20 +22,11 @@ st.title("📍 Confirm Location → 📦 Declare Multiple Items")
 st.markdown("""
 <style>
 .step-title {font-size:1.2rem;margin:0.35rem 0 0.2rem 0;}
-.catline {margin:0.05em 0;font-size:0.98em;}
-.cat-class {color:#C61C1C;font-weight:bold;}
-.cat-dept {color:#004CBB;font-weight:bold;}
-.cat-sect {color:#098A23;font-weight:bold;}
-.cat-family {color:#FF8800;font-weight:bold;}
-.cat-val {color:#111;}
 .okchip{display:inline-block;background:#E6F4EA;color:#0F9D58;border:1px solid #9CD1B5;
         padding:.15em .55em;border-radius:.6em;font-weight:600;margin-left:.35em;}
-.badchip{display:inline-block;background:#FDEDED;color:#D93025;border:1px solid #F3B1AB;
-        padding:.15em .55em;border-radius:.6em;font-weight:600;margin-left:.35em;}
-.scan-hint {font-size:1.05em;color:#087911;font-weight:600;background:#eafdff;padding:.2em .7em;border-radius:.45em;margin:.4em 0 .8em 0;text-align:center;}
-.small-dim {color:#666;font-size:.9em;margin-top:.25rem;}
 .tbl-note {color:#444;margin:0.35rem 0 0.3rem 0;}
 .locked-loc {background:#f4f9ff;border:1.5px solid #9dc3f5;border-radius:.6em;padding:.55em .8em;margin:.45em 0;}
+.scan-hint {font-size:1.05em;color:#087911;font-weight:600;background:#eafdff;padding:.2em .7em;border-radius:.45em;margin:.4em 0 .8em 0;text-align:center;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -60,11 +51,6 @@ def make_rectangle(x, y, w, h, deg):
     return pts
 
 def build_deck(shelf_locs, highlight_locs, selected_locid=""):
-    """
-    - Base PolygonLayer 'shelves'
-    - Optional selected overlay (blue outline)
-    - Tooltip shows a single-line label
-    """
     hi = set(map(str, highlight_locs or []))
     rows = []
     for row in shelf_locs:
@@ -98,7 +84,6 @@ def build_deck(shelf_locs, highlight_locs, selected_locid=""):
 
     layers = [base_layer]
 
-    # Selected overlay
     if selected_locid:
         sel_df = df[df["locid"] == str(selected_locid)]
         if not sel_df.empty:
@@ -116,19 +101,15 @@ def build_deck(shelf_locs, highlight_locs, selected_locid=""):
             )
             layers.append(sel_layer)
 
-    view_state = pdk.ViewState(
-        longitude=0.5, latitude=0.5,
-        zoom=6, min_zoom=4, max_zoom=20, pitch=0, bearing=0
-    )
+    view_state = pdk.ViewState(longitude=0.5, latitude=0.5, zoom=6, min_zoom=4, max_zoom=20, pitch=0, bearing=0)
 
-    deck = pdk.Deck(
+    return pdk.Deck(
         layers=layers,
         initial_view_state=view_state,
-        map_provider=None,  # normalized canvas 0..1
+        map_provider=None,
         tooltip={"html": "<b>{label_text}</b>", "style": {"fontSize": "14px", "font-family": "monospace"}},
         height=550,
     )
-    return deck
 
 # ==================== DATA ACCESS ====================
 class DeclareHandler(DatabaseManager):
@@ -160,9 +141,6 @@ class DeclareHandler(DatabaseManager):
         return df["locid"].tolist() if not df.empty else []
 
     def bulk_insert_declarations(self, rows):
-        """
-        rows: list of dicts with keys: itemid, locid, qty
-        """
         if not rows:
             return
         values = [(int(r["itemid"]), int(r["qty"]), str(r["locid"])) for r in rows]
@@ -193,8 +171,9 @@ class DeclareHandler(DatabaseManager):
 # ==================== STATE ====================
 st.session_state.setdefault("picked_locid", "")
 st.session_state.setdefault("loc_confirmed", False)
-st.session_state.setdefault("staged_items", [])  # list of dicts: {itemid, name, barcode, qty}
+st.session_state.setdefault("staged_items", [])   # [{itemid, name, barcode, qty}]
 st.session_state.setdefault("last_add_signature", ("", 0.0))  # (signature, ts)
+st.session_state.setdefault("clear_add_form", False)          # ← clearing flag
 
 handler = DeclareHandler()
 map_handler = ShelfMapHandler()
@@ -226,7 +205,7 @@ try:
             if locid_clicked:
                 st.session_state["picked_locid"] = locid_clicked
 except Exception:
-    pass  # fail gracefully
+    pass
 
 c1, c2 = st.columns([2, 1])
 typed_locid = c1.text_input(
@@ -254,52 +233,53 @@ if st.session_state["loc_confirmed"]:
     )
     if st.button("🔓 Change location"):
         st.session_state["loc_confirmed"] = False
-        st.session_state["staged_items"] = []  # clear staged when changing location
+        st.session_state["staged_items"] = []
         st.info("Location unlocked. Pick or type a new location, then confirm.")
 else:
     st.info("Choose a location on the map or type one, then press **Confirm Location**.")
-    st.stop()  # halt until location is confirmed
+    st.stop()
 
 # ==================== STEP 2: STAGE MULTIPLE ITEMS ====================
 st.markdown("<div class='step-title'>STEP 2 — Add items (you can add many) for the confirmed location</div>", unsafe_allow_html=True)
 locid = st.session_state["picked_locid"]
 
+# -------- Pre-widget clearing (runs BEFORE we create the inputs) --------
+if st.session_state["clear_add_form"]:
+    # Clear the input defaults BEFORE rendering widgets
+    st.session_state["barcode_input_multi"] = ""
+    st.session_state["qty_input_field"] = 1
+    st.session_state["clear_add_form"] = False
+
 with st.expander("➕ Add item by barcode", expanded=True):
-    # We use a FORM to prevent half-state during reruns
     with st.form(key="add_item_form", clear_on_submit=False):
         left, mid, right = st.columns([2.2, 1, 1])
 
-        # Optional QR scanner only PREFILLS the barcode field
-        prefill = ""
+        # Optional QR prefill (set only if we have a value and field is empty)
         if QR_AVAILABLE:
-            st.markdown("<div class='scan-hint'>Scan with webcam/phone, then press **Add to list**.</div>", unsafe_allow_html=True)
+            st.markdown("<div class='scan-hint'>Scan with webcam/phone, then press <b>Add to list</b>.</div>", unsafe_allow_html=True)
             scanned = qrcode_scanner(key="barcode_cam_multi") or ""
-            if scanned:
-                prefill = str(scanned).strip()
+            if scanned and not st.session_state.get("barcode_input_multi"):
+                st.session_state["barcode_input_multi"] = str(scanned).strip()
 
-        # Bind a dedicated state key; do NOT auto-fill from old adds
-        if "barcode_input_multi" not in st.session_state:
-            st.session_state["barcode_input_multi"] = ""
-
-        # If scanner read something this run, prefill once
-        if prefill:
-            st.session_state["barcode_input_multi"] = prefill
-
-        barcode_input = left.text_input(
+        barcode_val = left.text_input(
             "Barcode",
             key="barcode_input_multi",
             max_chars=32,
             placeholder="Scan or type barcode"
-        ).strip()
+        )
+        # We'll strip later without mutating session_state
 
-        qty_input = mid.number_input(
+        qty_val = mid.number_input(
             "Quantity",
-            min_value=1, value=1, step=1, key="qty_input_field"
+            min_value=1, value=st.session_state.get("qty_input_field", 1), step=1, key="qty_input_field"
         )
 
         submitted = right.form_submit_button("Add to list", use_container_width=True)
 
     if submitted:
+        barcode_input = (barcode_val or "").strip()
+        qty_input = int(qty_val or 1)
+
         if not barcode_input:
             st.warning("Please provide a barcode.")
         else:
@@ -318,7 +298,7 @@ with st.expander("➕ Add item by barcode", expanded=True):
                     merged = False
                     for row in st.session_state["staged_items"]:
                         if row["itemid"] == itemid:
-                            row["qty"] += int(qty_input)
+                            row["qty"] += qty_input
                             merged = True
                             break
                     if not merged:
@@ -326,16 +306,14 @@ with st.expander("➕ Add item by barcode", expanded=True):
                             "itemid": itemid,
                             "name": item["name"],
                             "barcode": str(item["barcode"]),
-                            "qty": int(qty_input),
+                            "qty": qty_input,
                         })
-                    st.success(f"Added: {item['name']} × {int(qty_input)}")
-
-                    # Remember signature moment to prevent immediate duplicate on rerun
+                    st.success(f"Added: {item['name']} × {qty_input}")
                     st.session_state["last_add_signature"] = (signature, now)
 
-                # Clear the input fields for the next scan/type
-                st.session_state["barcode_input_multi"] = ""
-                st.session_state["qty_input_field"] = 1
+                # Instead of mutating widget state now, flag & rerun
+                st.session_state["clear_add_form"] = True
+                st.rerun()
 
 # Staged items table with inline quantity editing & remove
 if st.session_state["staged_items"]:
@@ -359,12 +337,11 @@ if st.session_state["staged_items"]:
         with c5:
             remove = st.button("🗑️", key=f"rm_{idx}")
             if remove:
-                continue  # drop this row
+                continue
         new_rows.append({**row, "qty": int(new_qty)})
 
     st.session_state["staged_items"] = new_rows
 
-    # Final actions row
     cL, cR = st.columns([1, 2])
     clear_all = cL.button("Clear list")
     commit = cR.button("✅ Confirm ALL declarations to this location", type="primary")
@@ -376,8 +353,7 @@ if st.session_state["staged_items"]:
     if commit:
         rows = [
             {"itemid": r["itemid"], "locid": locid, "qty": int(r["qty"])}
-            for r in st.session_state["staged_items"]
-            if int(r["qty"]) > 0
+            for r in st.session_state["staged_items"] if int(r["qty"]) > 0
         ]
         if not rows:
             st.error("Nothing to commit. Please add items with positive quantities.")
