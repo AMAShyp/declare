@@ -29,7 +29,6 @@ def _get_credentials():
 
 @st.cache_resource(show_spinner=False)
 def _get_connector():
-    # one Connector per process
     return Connector(credentials=_get_credentials())
 
 
@@ -47,33 +46,28 @@ def _get_conn_for_session(
     ip_type: IPTypes,
 ):
     """
-    One DB-API connection per Streamlit session, created via Cloud SQL Connector using pg8000 driver.
+    One DB-API connection per Streamlit session, created via Cloud SQL Connector using pg8000.
     """
     connector = _get_connector()
-
-    # IMPORTANT: use driver="pg8000" (psycopg2 is not supported by the connector)
     conn = connector.connect(
         instance_connection_name,
-        "pg8000",
+        "pg8000",  # IMPORTANT: pg8000 (psycopg2 isn't supported by the connector)
         user=user,
         password=password,
         db=db,
         ip_type=ip_type,
     )
 
-    # Clean up on session end
     try:
         st.on_session_end(lambda: _safe_close(conn, connector))
     except Exception:
         pass
 
-    # pg8000 starts with autocommit False (same as psycopg2 default)
-    return conn
+    return conn  # pg8000 autocommit is False by default
 
 
 def _safe_close(conn, connector: Connector):
     try:
-        # pg8000 connection has .close() and .closed attribute (bool)
         if conn and not getattr(conn, "closed", False):
             conn.close()
     except Exception:
@@ -86,7 +80,6 @@ def _safe_close(conn, connector: Connector):
 
 # ───────────────────────────────────────────────────────────────
 # Database Manager (Cloud SQL + pg8000)
-# Public API unchanged
 # ───────────────────────────────────────────────────────────────
 class DatabaseManager:
     """
@@ -134,33 +127,42 @@ class DatabaseManager:
         )
 
     def _ensure_live_conn(self):
+        # Cheap liveness check without context manager
         try:
-            # Cheap liveness check: simple round-trip
-            with self.conn.cursor() as cur:
+            cur = self.conn.cursor()
+            try:
                 cur.execute("SELECT 1")
                 cur.fetchone()
+            finally:
+                cur.close()
         except Exception:
             self._reconnect()
 
     def _fetch_df(self, query: str, params: Optional[Iterable[Any]] = None) -> pd.DataFrame:
         self._ensure_live_conn()
         try:
-            with self.conn.cursor() as cur:
+            cur = self.conn.cursor()
+            try:
                 cur.execute(query, params or ())
                 rows = cur.fetchall()
                 cols = [c[0] for c in cur.description]
+            finally:
+                cur.close()
             return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
         except Exception:
-            # rollback & retry once on any dbapi error (covers connection & txn errors)
+            # rollback & retry once on any dbapi error
             try:
                 self.conn.rollback()
             except Exception:
                 pass
             self._reconnect()
-            with self.conn.cursor() as cur:
+            cur = self.conn.cursor()
+            try:
                 cur.execute(query, params or ())
                 rows = cur.fetchall()
                 cols = [c[0] for c in cur.description]
+            finally:
+                cur.close()
             return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
 
     def _execute(
@@ -171,9 +173,12 @@ class DatabaseManager:
     ):
         self._ensure_live_conn()
         try:
-            with self.conn.cursor() as cur:
+            cur = self.conn.cursor()
+            try:
                 cur.execute(query, params or ())
                 res = cur.fetchone() if returning else None
+            finally:
+                cur.close()
             self.conn.commit()
             return res
         except Exception:
@@ -183,9 +188,12 @@ class DatabaseManager:
             except Exception:
                 pass
             self._reconnect()
-            with self.conn.cursor() as cur:
+            cur = self.conn.cursor()
+            try:
                 cur.execute(query, params or ())
                 res = cur.fetchone() if returning else None
+            finally:
+                cur.close()
             self.conn.commit()
             return res
 
