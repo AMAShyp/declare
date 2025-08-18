@@ -1,23 +1,18 @@
 # db_handler.py
 import uuid
-import time
-import traceback
 from typing import Any, Iterable, Optional, List
 
 import streamlit as st
 import pandas as pd
-import psycopg2
-from psycopg2 import OperationalError, InterfaceError, DatabaseError
 
 from google.cloud.sql.connector import Connector, IPTypes
 from google.oauth2 import service_account
 
 
 # ───────────────────────────────────────────────────────────────
-# 0) Helpers: session identity + cached resources
+# Session + cached resources
 # ───────────────────────────────────────────────────────────────
 def _session_key() -> str:
-    """Unique key for current Streamlit user session."""
     if "_session_key" not in st.session_state:
         st.session_state["_session_key"] = uuid.uuid4().hex
     return st.session_state["_session_key"]
@@ -25,7 +20,6 @@ def _session_key() -> str:
 
 @st.cache_resource(show_spinner=False)
 def _get_credentials():
-    """Build Google service account credentials from Streamlit secrets."""
     if "gcp_service_account" not in st.secrets:
         raise RuntimeError("Missing [gcp_service_account] in secrets.toml")
     return service_account.Credentials.from_service_account_info(
@@ -35,15 +29,12 @@ def _get_credentials():
 
 @st.cache_resource(show_spinner=False)
 def _get_connector():
-    """Create a single Cloud SQL Connector instance for the process."""
-    creds = _get_credentials()
-    return Connector(credentials=creds)
+    # one Connector per process
+    return Connector(credentials=_get_credentials())
 
 
 def _ip_type_from_secret(val: Optional[str]) -> IPTypes:
-    if (val or "").strip().upper() == "PRIVATE":
-        return IPTypes.PRIVATE
-    return IPTypes.PUBLIC
+    return IPTypes.PRIVATE if (val or "").strip().upper() == "PRIVATE" else IPTypes.PUBLIC
 
 
 @st.cache_resource(show_spinner=False)
@@ -56,33 +47,34 @@ def _get_conn_for_session(
     ip_type: IPTypes,
 ):
     """
-    One psycopg2 connection per Streamlit session, created via Cloud SQL Connector.
+    One DB-API connection per Streamlit session, created via Cloud SQL Connector using pg8000 driver.
     """
     connector = _get_connector()
 
+    # IMPORTANT: use driver="pg8000" (psycopg2 is not supported by the connector)
     conn = connector.connect(
         instance_connection_name,
-        "psycopg2",
+        "pg8000",
         user=user,
         password=password,
         db=db,
         ip_type=ip_type,
     )
 
-    # Graceful cleanup when the Streamlit session ends.
+    # Clean up on session end
     try:
         st.on_session_end(lambda: _safe_close(conn, connector))
     except Exception:
         pass
 
-    # psycopg2 default is autocommit = False → keep it explicit
-    conn.autocommit = False
+    # pg8000 starts with autocommit False (same as psycopg2 default)
     return conn
 
 
 def _safe_close(conn, connector: Connector):
     try:
-        if conn and getattr(conn, "closed", 1) == 0:
+        # pg8000 connection has .close() and .closed attribute (bool)
+        if conn and not getattr(conn, "closed", False):
             conn.close()
     except Exception:
         pass
@@ -93,23 +85,14 @@ def _safe_close(conn, connector: Connector):
 
 
 # ───────────────────────────────────────────────────────────────
-# 1) Database Manager (Cloud SQL + psycopg2) with auto-reconnect
+# Database Manager (Cloud SQL + pg8000)
+# Public API unchanged
 # ───────────────────────────────────────────────────────────────
 class DatabaseManager:
     """
-    Rewritten to use Cloud SQL (PostgreSQL) via the Cloud SQL Python Connector.
-    Reads config from:
-      [cloudsql]
-        instance_connection_name, user, password, db, ip_type (PUBLIC|PRIVATE)
-      [gcp_service_account]
-        ... full service account json fields ...
-
-    Public API unchanged:
-      - fetch_data(query, params=None) -> DataFrame
-      - execute_command(query, params=None) -> None
-      - execute_command_returning(query, params=None) -> tuple | None
-      - get_all_sections(), get_dropdown_values(section), get_suppliers(), add_inventory(data)
-      - check_foreign_key_references(referenced_table, referenced_column, value) -> list[str]
+    Uses Cloud SQL Connector (driver=pg8000). Reads:
+      [cloudsql] instance_connection_name, user, password, db, ip_type
+      [gcp_service_account] full service account JSON
     """
 
     def __init__(self):
@@ -138,43 +121,28 @@ class DatabaseManager:
             self._ip_type,
         )
 
-    # ────────── internal helpers ──────────
+    # ────────── internals ──────────
+    def _reconnect(self):
+        _get_conn_for_session.clear()
+        self.conn = _get_conn_for_session(
+            self._sess_key,
+            self._instance_connection_name,
+            self._user,
+            self._password,
+            self._db,
+            self._ip_type,
+        )
+
     def _ensure_live_conn(self):
-        """
-        Ensure connection is open; if not, rebuild it for this session.
-        """
         try:
-            if getattr(self.conn, "closed", 1) != 0:
-                _get_conn_for_session.clear()  # clear cached resource for this session
-                self.conn = _get_conn_for_session(
-                    self._sess_key,
-                    self._instance_connection_name,
-                    self._user,
-                    self._password,
-                    self._db,
-                    self._ip_type,
-                )
-            else:
-                # Cheap liveness check: cursor() and NOOP
-                with self.conn.cursor() as cur:
-                    cur.execute("SELECT 1;")
-                    cur.fetchone()
-        except (OperationalError, InterfaceError):
-            _get_conn_for_session.clear()
-            self.conn = _get_conn_for_session(
-                self._sess_key,
-                self._instance_connection_name,
-                self._user,
-                self._password,
-                self._db,
-                self._ip_type,
-            )
+            # Cheap liveness check: simple round-trip
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        except Exception:
+            self._reconnect()
 
     def _fetch_df(self, query: str, params: Optional[Iterable[Any]] = None) -> pd.DataFrame:
-        """
-        Execute a SELECT and return DataFrame.
-        Auto-reconnects on transient connection errors. Rolls back on failure.
-        """
         self._ensure_live_conn()
         try:
             with self.conn.cursor() as cur:
@@ -182,25 +150,18 @@ class DatabaseManager:
                 rows = cur.fetchall()
                 cols = [c[0] for c in cur.description]
             return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
-        except (OperationalError, InterfaceError):
-            # Reconnect and retry once
-            _get_conn_for_session.clear()
-            self.conn = _get_conn_for_session(
-                self._sess_key,
-                self._instance_connection_name,
-                self._user,
-                self._password,
-                self._db,
-                self._ip_type,
-            )
+        except Exception:
+            # rollback & retry once on any dbapi error (covers connection & txn errors)
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            self._reconnect()
             with self.conn.cursor() as cur:
                 cur.execute(query, params or ())
                 rows = cur.fetchall()
                 cols = [c[0] for c in cur.description]
             return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
-        except Exception:
-            self.conn.rollback()
-            raise
 
     def _execute(
         self,
@@ -208,9 +169,6 @@ class DatabaseManager:
         params: Optional[Iterable[Any]] = None,
         returning: bool = False,
     ):
-        """
-        Execute INSERT/UPDATE/DELETE. If returning=True, fetchone() is returned.
-        """
         self._ensure_live_conn()
         try:
             with self.conn.cursor() as cur:
@@ -218,25 +176,18 @@ class DatabaseManager:
                 res = cur.fetchone() if returning else None
             self.conn.commit()
             return res
-        except (OperationalError, InterfaceError):
-            # Reconnect and retry once
-            _get_conn_for_session.clear()
-            self.conn = _get_conn_for_session(
-                self._sess_key,
-                self._instance_connection_name,
-                self._user,
-                self._password,
-                self._db,
-                self._ip_type,
-            )
+        except Exception:
+            # rollback & retry once
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            self._reconnect()
             with self.conn.cursor() as cur:
                 cur.execute(query, params or ())
                 res = cur.fetchone() if returning else None
             self.conn.commit()
             return res
-        except Exception:
-            self.conn.rollback()
-            raise
 
     # ────────── public API ──────────
     def fetch_data(self, query: str, params: Optional[Iterable[Any]] = None) -> pd.DataFrame:
@@ -278,11 +229,6 @@ class DatabaseManager:
         referenced_column: str,
         value: Any,
     ) -> List[str]:
-        """
-        Return a list of tables that still reference the given value
-        through a FOREIGN KEY constraint.
-        Empty list → safe to delete.
-        """
         fk_sql = """
             SELECT tc.table_schema,
                    tc.table_name
